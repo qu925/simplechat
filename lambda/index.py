@@ -1,140 +1,105 @@
 # lambda/index.py
 import json
 import os
-import boto3
-import re  # 正規表現モジュールをインポート
-from botocore.exceptions import ClientError
+import re
+import urllib.request
+import urllib.error
+
+# ---------- 設定 ----------
+INFERENCE_URL = os.environ.get(
+    "INFERENCE_URL",   # CDK かマネジメントコンソールで設定しておく
+    "https://df52-34-143-237-29.ngrok-free.app/generate"
+)
+# デフォルトの生成パラメータ。必要なら環境変数にしても OK
+GEN_CFG = {
+    "max_new_tokens": 512,
+    "do_sample": True,
+    "temperature": 0.7,
+    "top_p": 0.9,
+}
+
+# ---------- 共通ヘッダー ----------
+CORS_HEADERS = {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": (
+        "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token"
+    ),
+    "Access-Control-Allow-Methods": "OPTIONS,POST",
+}
 
 
-# Lambda コンテキストからリージョンを抽出する関数
-def extract_region_from_arn(arn):
-    # ARN 形式: arn:aws:lambda:region:account-id:function:function-name
-    match = re.search('arn:aws:lambda:([^:]+):', arn)
-    if match:
-        return match.group(1)
-    return "us-east-1"  # デフォルト値
-
-# グローバル変数としてクライアントを初期化（初期値）
-bedrock_client = None
-
-# モデルID
-MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
-
+# ---------- Lambda ハンドラ ----------
 def lambda_handler(event, context):
     try:
-        # コンテキストから実行リージョンを取得し、クライアントを初期化
-        global bedrock_client
-        if bedrock_client is None:
-            region = extract_region_from_arn(context.invoked_function_arn)
-            bedrock_client = boto3.client('bedrock-runtime', region_name=region)
-            print(f"Initialized Bedrock client in region: {region}")
-        
         print("Received event:", json.dumps(event))
-        
-        # Cognitoで認証されたユーザー情報を取得
-        user_info = None
-        if 'requestContext' in event and 'authorizer' in event['requestContext']:
-            user_info = event['requestContext']['authorizer']['claims']
-            print(f"Authenticated user: {user_info.get('email') or user_info.get('cognito:username')}")
-        
-        # リクエストボディの解析
-        body = json.loads(event['body'])
-        message = body['message']
-        conversation_history = body.get('conversationHistory', [])
-        
-        print("Processing message:", message)
-        print("Using model:", MODEL_ID)
-        
-        # 会話履歴を使用
-        messages = conversation_history.copy()
-        
-        # ユーザーメッセージを追加
-        messages.append({
-            "role": "user",
-            "content": message
-        })
-        
-        # Nova Liteモデル用のリクエストペイロードを構築
-        # 会話履歴を含める
-        bedrock_messages = []
-        for msg in messages:
-            if msg["role"] == "user":
-                bedrock_messages.append({
-                    "role": "user",
-                    "content": [{"text": msg["content"]}]
-                })
-            elif msg["role"] == "assistant":
-                bedrock_messages.append({
-                    "role": "assistant", 
-                    "content": [{"text": msg["content"]}]
-                })
-        
-        # invoke_model用のリクエストペイロード
-        request_payload = {
-            "messages": bedrock_messages,
-            "inferenceConfig": {
-                "maxTokens": 512,
-                "stopSequences": [],
-                "temperature": 0.7,
-                "topP": 0.9
-            }
-        }
-        
-        print("Calling Bedrock invoke_model API with payload:", json.dumps(request_payload))
-        
-        # invoke_model APIを呼び出し
-        response = bedrock_client.invoke_model(
-            modelId=MODEL_ID,
-            body=json.dumps(request_payload),
-            contentType="application/json"
+
+        # --- リクエスト取り出し ---
+        body = json.loads(event["body"])
+        message: str = body["message"]
+        conversation_history = body.get("conversationHistory", [])
+        print("User message:", message)
+
+        # --- prompt 構築（最小構成） ---
+        #   まずは最新メッセージだけを送る
+        prompt = message
+
+        # --- FastAPI 推論エンドポイント呼び出し ---
+        payload = dict(GEN_CFG, prompt=prompt)
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            INFERENCE_URL,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "accept": "application/json",
+            },
         )
-        
-        # レスポンスを解析
-        response_body = json.loads(response['body'].read())
-        print("Bedrock response:", json.dumps(response_body, default=str))
-        
-        # 応答の検証
-        if not response_body.get('output') or not response_body['output'].get('message') or not response_body['output']['message'].get('content'):
-            raise Exception("No response content from the model")
-        
-        # アシスタントの応答を取得
-        assistant_response = response_body['output']['message']['content'][0]['text']
-        
-        # アシスタントの応答を会話履歴に追加
-        messages.append({
-            "role": "assistant",
-            "content": assistant_response
-        })
-        
-        # 成功レスポンスの返却
+
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                resp_body = resp.read().decode("utf-8")
+                print("Inference raw response:", resp_body)
+                resp_json = json.loads(resp_body)
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(
+                f"Inference API returned {e.code}: {e.read().decode()}"
+            ) from e
+
+        # --- 生成テキストを抽出 ---
+        assistant_response = (
+            resp_json.get("generated_text")
+            or resp_json.get("text")
+            or resp_json.get("response")
+            or resp_json.get("result")
+        )
+        if not assistant_response:
+            raise ValueError("No text found in inference response")
+
+        # --- 会話履歴を拡張して返却 ---
+        conversation_history.append({"role": "user", "content": message})
+        conversation_history.append(
+            {"role": "assistant", "content": assistant_response}
+        )
+
         return {
             "statusCode": 200,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
-                "Access-Control-Allow-Methods": "OPTIONS,POST"
-            },
-            "body": json.dumps({
-                "success": True,
-                "response": assistant_response,
-                "conversationHistory": messages
-            })
+            "headers": CORS_HEADERS,
+            "body": json.dumps(
+                {
+                    "success": True,
+                    "response": assistant_response,
+                    "conversationHistory": conversation_history,
+                }
+            ),
         }
-        
-    except Exception as error:
-        print("Error:", str(error))
-        
+
+    except Exception as err:
+        print("Error:", err)
         return {
             "statusCode": 500,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
-                "Access-Control-Allow-Methods": "OPTIONS,POST"
-            },
-            "body": json.dumps({
-                "success": False,
-                "error": str(error)
-            })
+            "headers": CORS_HEADERS,
+            "body": json.dumps({"success": False, "error": str(err)}),
         }
+
